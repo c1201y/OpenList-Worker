@@ -9,6 +9,10 @@ import {
   PersonalListResp,
   PersonalDownloadResp,
   PersonalFileItem,
+  PartInfo,
+  PersonalPartInfo,
+  PersonalUploadResp,
+  PersonalUploadUrlResp,
 } from "./types"
 
 export function encodeURIComponentCustom(str: string): string {
@@ -357,7 +361,8 @@ export class Yun139ApiClient {
 
   async deleteFile(contentIdOrFileId: string): Promise<void> {
     if (this.isPersonalNew()) {
-      await this.request("/file/delete", {
+      // 个人云新版删除走回收站接口（/file/delete 会返回认证失败）
+      await this.request("/recyclebin/batchTrash", {
         fileIds: [contentIdOrFileId],
       })
       return
@@ -377,7 +382,8 @@ export class Yun139ApiClient {
 
   async deleteCatalog(catalogIdOrFileId: string): Promise<void> {
     if (this.isPersonalNew()) {
-      await this.request("/file/delete", {
+      // 个人云新版删除走回收站接口（/file/delete 会返回认证失败）
+      await this.request("/recyclebin/batchTrash", {
         fileIds: [catalogIdOrFileId],
       })
       return
@@ -416,6 +422,156 @@ export class Yun139ApiClient {
         },
       },
     )
+  }
+
+  /**
+   * 分片大小（字节）。用户可经 custom_upload_part_size 覆盖；默认 100MB，
+   * 文件超过 30GB 时用 512MB 以规避网盘的分片数量上限。
+   */
+  private getUploadPartSize(size: number): number {
+    if (this.addition.custom_upload_part_size) {
+      return this.addition.custom_upload_part_size
+    }
+    if (size > 30 * 1024 * 1024 * 1024) {
+      return 512 * 1024 * 1024
+    }
+    return 100 * 1024 * 1024
+  }
+
+  /** 计算整文件的 SHA-256（十六进制小写），作为秒传与完整性校验依据 */
+  async sha256Hex(content: Uint8Array): Promise<string> {
+    const digest = await crypto.subtle.digest(
+      "SHA-256",
+      content as unknown as BufferSource,
+    )
+    return Array.from(new Uint8Array(digest))
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("")
+  }
+
+  /**
+   * 按服务端返回的地址逐片 PUT 到 EOS。uploadPartInfos 只覆盖部分分片
+   * （创建时最多 100 片、其余走 getUploadUrl），故用 partNumber 反查偏移。
+   */
+  async uploadPersonalParts(
+    partInfos: PartInfo[],
+    uploadPartInfos: PersonalPartInfo[],
+    content: Buffer | Uint8Array,
+  ): Promise<void> {
+    const sorted = [...uploadPartInfos].sort(
+      (a, b) => a.partNumber - b.partNumber,
+    )
+    for (const uploadPartInfo of sorted) {
+      const index = uploadPartInfo.partNumber - 1
+      if (index < 0 || index >= partInfos.length) {
+        throw new Error(
+          `invalid partNumber ${uploadPartInfo.partNumber}: out of bounds (partInfos length: ${partInfos.length})`,
+        )
+      }
+      const { partOffset } = partInfos[index].parallelHashCtx
+      const partSize = partInfos[index].partSize
+      const bytes = content.subarray(partOffset, partOffset + partSize)
+
+      const res = await fetch(uploadPartInfo.uploadUrl, {
+        method: "PUT",
+        headers: {
+          "Content-Type": "application/octet-stream",
+          Origin: "https://yun.139.com",
+          Referer: "https://yun.139.com/",
+        },
+        body: bytes as unknown as BodyInit,
+      })
+      if (!res.ok) {
+        const text = await res.text().catch(() => "")
+        throw new Error(
+          `139 part upload failed (${res.status}): ${String(text).slice(0, 200)}`,
+        )
+      }
+    }
+  }
+
+  /**
+   * 个人云新版上传：/file/create 建任务并取前 100 片地址 → 逐片 PUT →
+   * /file/complete 收尾。返回云端实际文件名（命中 auto_rename 时会与入参不同）。
+   */
+  async uploadPersonalFile(
+    parentFileId: string,
+    name: string,
+    content: Buffer | Uint8Array,
+  ): Promise<{ fileName: string }> {
+    const size = content.length
+    const partSize = this.getUploadPartSize(size)
+    const partCount = size > partSize ? Math.ceil(size / partSize) : 1
+
+    const partInfos: PartInfo[] = []
+    for (let i = 0; i < partCount; i++) {
+      const start = i * partSize
+      const byteSize = Math.min(size - start, partSize)
+      partInfos.push({
+        partNumber: i + 1,
+        partSize: byteSize,
+        parallelHashCtx: { partOffset: start },
+      })
+    }
+
+    const fullHash = await this.sha256Hex(content)
+
+    const createResp = await this.request<PersonalUploadResp>("/file/create", {
+      contentHash: fullHash,
+      contentHashAlgorithm: "SHA256",
+      contentType: "application/octet-stream",
+      parallelUpload: false,
+      partInfos: partInfos.slice(0, 100),
+      size,
+      parentFileId: parentFileId || this.addition.root_folder_id || "/",
+      name,
+      type: "file",
+      fileRenameMode: "auto_rename",
+    })
+
+    // exist=true：云端已有同名同内容文件（秒传命中），无需实际上传
+    if (createResp.data?.exist) {
+      return { fileName: createResp.data?.fileName || name }
+    }
+
+    const fileId = createResp.data?.fileId || ""
+    const uploadId = createResp.data?.uploadId || ""
+    const initialParts = createResp.data?.partInfos
+
+    if (initialParts && initialParts.length > 0) {
+      await this.uploadPersonalParts(partInfos, initialParts, content)
+
+      // 超过 100 片：分批向 /file/getUploadUrl 索取剩余分片地址
+      for (let i = 100; i < partInfos.length; i += 100) {
+        const batch = partInfos.slice(i, i + 100)
+        const moreResp = await this.request<PersonalUploadUrlResp>(
+          "/file/getUploadUrl",
+          {
+            fileId,
+            uploadId,
+            partInfos: batch,
+            commonAccountInfo: {
+              account: this.account,
+              accountType: 1,
+            },
+          },
+        )
+        await this.uploadPersonalParts(
+          partInfos,
+          moreResp.data?.partInfos || [],
+          content,
+        )
+      }
+
+      await this.request("/file/complete", {
+        contentHash: fullHash,
+        contentHashAlgorithm: "SHA256",
+        fileId,
+        uploadId,
+      })
+    }
+
+    return { fileName: createResp.data?.fileName || name }
   }
 
   async getStorageDetails(): Promise<{ total?: number; used?: number }> {

@@ -125,3 +125,45 @@ export interface PersonalDownloadResp {
     cdnSwitch?: boolean
   }
 }
+
+/** 个人云新版分片上传：请求分片元信息 */
+export interface PartInfo {
+  partNumber: number
+  partSize: number
+  parallelHashCtx: {
+    partOffset: number
+  }
+}
+
+/** 个人云新版分片上传：服务端返回的单片上传地址 */
+export interface PersonalPartInfo {
+  partNumber: number
+  uploadUrl: string
+}
+
+/** /file/create 响应：创建上传任务（命中秒传时 exist 为 true） */
+export interface PersonalUploadResp {
+  code?: string
+  message?: string
+  success?: boolean
+  data?: {
+    fileId?: string
+    fileName?: string
+    partInfos?: PersonalPartInfo[]
+    exist?: boolean
+    rapidUpload?: boolean
+    uploadId?: string
+  }
+}
+
+/** /file/getUploadUrl 响应：批量补充剩余分片的上传地址 */
+export interface PersonalUploadUrlResp {
+  code?: string
+  message?: string
+  success?: boolean
+  data?: {
+    fileId?: string
+    uploadId?: string
+    partInfos?: PersonalPartInfo[]
+  }
+}

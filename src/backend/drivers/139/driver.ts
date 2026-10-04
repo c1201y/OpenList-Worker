@@ -247,9 +247,65 @@ export class Yun139Driver implements StorageDriver {
   async put(
     virtualPath: string,
     physicalPath: string,
-    content: Buffer | Uint8Array,
+    content: Buffer,
   ): Promise<void> {
-    console.warn(`[139] put for ${physicalPath}`)
+    if (!this.client.isPersonalNew()) {
+      throw new Error(
+        "139 upload is only implemented for the personal_new type",
+      )
+    }
+
+    const clean = this.cleanPath(physicalPath)
+    const name = clean.split("/").filter(Boolean).pop()
+    if (!name) {
+      throw new Error(`invalid upload path: ${physicalPath}`)
+    }
+    const parentPath = clean.substring(0, clean.lastIndexOf("/")) || "/"
+    const parentCatalogId = await this.resolveCatalogId(parentPath)
+
+    const { fileName } = await this.client.uploadPersonalFile(
+      parentCatalogId,
+      name,
+      content,
+    )
+
+    // auto_rename 命中同名文件时云端会自动改名，归位一次，确保文件最终落在目标名上
+    if (fileName && fileName !== name) {
+      await this.resolveUploadConflict(parentPath, name, fileName)
+    }
+  }
+
+  /**
+   * 处理上传命名冲突：删除同名旧文件，并把云端自动改名的新文件改回目标名。
+   * 冲突归位属尽力而为，失败只告警——文件本身已上传成功。
+   */
+  private async resolveUploadConflict(
+    dirPath: string,
+    wantedName: string,
+    actualName: string,
+  ): Promise<void> {
+    try {
+      // 给服务端一点时间刷新列表
+      await new Promise((r) => setTimeout(r, 500))
+      const catalogId = await this.resolveCatalogId(dirPath)
+      const disk = await this.client.listFiles(catalogId)
+
+      const oldFile = disk.files.find((f) => f.contentName === wantedName)
+      if (oldFile?.contentID) {
+        await this.client.rename(
+          oldFile.contentID,
+          wantedName + Math.random().toString(36).slice(2, 6),
+        )
+        await this.client.deleteFile(oldFile.contentID)
+      }
+
+      const newFile = disk.files.find((f) => f.contentName === actualName)
+      if (newFile?.contentID) {
+        await this.client.rename(newFile.contentID, wantedName)
+      }
+    } catch (e) {
+      console.warn("[139] upload conflict handling failed:", e)
+    }
   }
 
   async getDetails(): Promise<{ total_space?: number; used_space?: number }> {
