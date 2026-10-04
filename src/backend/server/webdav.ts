@@ -92,7 +92,78 @@ function splitPath(p: string): { dir: string; name: string } {
   return { dir, name }
 }
 
+/**
+ * /dav 的 CORS 支持。
+ *
+ * 背景：/dav 是独立挂在顶层 app 上的路由（index.ts: app.route("/dav", webdavRouter)），
+ * 不在 /api 那套 CORS 中间件的覆盖范围内。当站点部署在与 OpenList 不同的源
+ * （GitHub Pages、本地 dev server 等）时，浏览器直连 WebDAV 上传会：
+ *   ① 因 PUT + Authorization 触发预检 OPTIONS；
+ *   ② 而本路由「先鉴权、后分发」，预检不带 Authorization → 直接 401 且无 CORS 头
+ *      → 预检失败，请求被浏览器拦下（控制台报 CORS policy）。
+ * 「上传找不到文件」在浏览器侧还可能是这一层拦下的，未必是驱动问题。
+ *
+ * 处理：预检 OPTIONS 在鉴权之前放行（2xx），并为所有 /dav 响应补 CORS 头。
+ * 来源策略与 /api 保持一致：优先 ALLOW_URLS 白名单（逗号分隔）；未配置时仅放行同源。
+ */
+function davAllowedOrigin(c: any): string | null {
+  const origin = c.req.header("Origin")
+  if (!origin) return null
+  const env = c.env || {}
+  const raw = String(
+    env.ALLOW_URLS ||
+      (typeof process !== "undefined" ? process.env?.ALLOW_URLS : "") ||
+      "",
+  ).trim()
+  if (raw) {
+    const list = raw
+      .split(",")
+      .map((s: string) => s.trim())
+      .filter(Boolean)
+    return list.includes(origin) ? origin : null
+  }
+  // 无白名单：仅同源（Origin 的 host 与请求 Host 一致）
+  try {
+    if (new URL(origin).host === (c.req.header("host") || "")) return origin
+  } catch {}
+  return null
+}
+
+/** 给 /dav 响应补 CORS 头；预检与实体请求都要带，否则浏览器会拦。 */
+function applyDavCors(c: any): void {
+  const allowed = davAllowedOrigin(c)
+  if (!allowed) return
+  c.header("Access-Control-Allow-Origin", allowed)
+  c.header("Vary", "Origin")
+  c.header(
+    "Access-Control-Allow-Methods",
+    "OPTIONS, GET, HEAD, PUT, MKCOL, DELETE, MOVE, COPY, PROPFIND",
+  )
+  c.header(
+    "Access-Control-Allow-Headers",
+    "Authorization, Content-Type, Depth, Destination, Overwrite, X-Requested-With",
+  )
+  c.header(
+    "Access-Control-Expose-Headers",
+    "Content-Length, Content-Type, DAV, Allow",
+  )
+}
+
 webdavRouter.all("/*", async (c) => {
+  applyDavCors(c)
+
+  // 跨域预检必须早于鉴权：浏览器不会在 OPTIONS 里带 Authorization，
+  // 若走下面的鉴权会直接 401，预检即失败。
+  if (c.req.method.toUpperCase() === "OPTIONS") {
+    c.header("DAV", "1, 2")
+    c.header(
+      "Allow",
+      "OPTIONS, PROPFIND, GET, HEAD, PUT, MKCOL, DELETE, MOVE, COPY",
+    )
+    c.header("MS-Author-Via", "DAV")
+    return c.body(null, 204)
+  }
+
   const user = await webdavAuth(c)
   if (!user) {
     return c.text("Unauthorized", 401, {
